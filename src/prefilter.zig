@@ -214,6 +214,71 @@ pub fn extractSingleClassRepeat(root: *const ast.Node) ?*const ast.Class {
     }
 }
 
+/// If the entire AST is a pure literal alternation — `foo|bar|baz`, with
+/// each branch a concat of `.literal` nodes only — return the branch byte
+/// strings. Callers dispatch to a multi-literal scanner that finds the
+/// earliest match across all needles via per-needle `indexOfPos`. This is
+/// the same niche `aho-corasick`'s Teddy fills for ripgrep.
+///
+/// Returns null for any branch that isn't purely literal, or for a single
+/// branch (that'd already be caught by `extractFullLiteral`). Caller owns
+/// the returned slice via the passed arena.
+pub fn extractLiteralAlternation(arena: std.mem.Allocator, root: *const ast.Node) !?[]const []const u8 {
+    // Unwrap one layer of non-capturing group at the root (very common
+    // shape from `(?:foo|bar)`).
+    var n = root;
+    if (n.* == .group) {
+        const g = n.group;
+        if (g.capturing) return null;
+        n = g.sub;
+    }
+    if (n.* != .alt) return null;
+    const branches = n.alt;
+    if (branches.len < 2) return null;
+
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |b| arena.free(b);
+        out.deinit(arena);
+    }
+    for (branches) |branch| {
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(arena);
+        if (!try collectBranchLiteral(branch, arena, &bytes)) {
+            bytes.deinit(arena);
+            for (out.items) |b| arena.free(b);
+            out.deinit(arena);
+            return null;
+        }
+        if (bytes.items.len == 0) {
+            // Empty branch — would match at every position, not worth this fast path.
+            bytes.deinit(arena);
+            for (out.items) |b| arena.free(b);
+            out.deinit(arena);
+            return null;
+        }
+        try out.append(arena, try bytes.toOwnedSlice(arena));
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+fn collectBranchLiteral(node: *const ast.Node, arena: std.mem.Allocator, buf: *std.ArrayList(u8)) !bool {
+    return switch (node.*) {
+        .literal => |c| blk: {
+            try buf.append(arena, c);
+            break :blk true;
+        },
+        .concat => |children| blk: {
+            for (children) |child| {
+                if (!try collectBranchLiteral(child, arena, buf)) break :blk false;
+            }
+            break :blk true;
+        },
+        .group => |g| if (g.capturing) false else collectBranchLiteral(g.sub, arena, buf),
+        else => false,
+    };
+}
+
 // ── Tests ──
 
 const parser = @import("parser.zig");
@@ -380,4 +445,52 @@ test "single-class-repeat: alternation blocks" {
 test "single-class-repeat: star (min=0) skipped" {
     // min=0 has a zero-width-match quirk — not yet handled by the fast path.
     try std.testing.expect(!(try singleClassFor("\\d*")));
+}
+
+fn altLiteralFor(alloc: std.mem.Allocator, pattern: []const u8) !?[][]const u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), pattern);
+    const root = try p.parseRoot();
+    const lits = try extractLiteralAlternation(arena.allocator(), root);
+    if (lits) |bs| {
+        var owned = try alloc.alloc([]const u8, bs.len);
+        for (bs, 0..) |b, i| owned[i] = try alloc.dupe(u8, b);
+        return owned;
+    }
+    return null;
+}
+
+test "literal alternation: three branches" {
+    const got = (try altLiteralFor(std.testing.allocator, "foo|bar|baz")).?;
+    defer {
+        for (got) |b| std.testing.allocator.free(b);
+        std.testing.allocator.free(got);
+    }
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqualStrings("foo", got[0]);
+    try std.testing.expectEqualStrings("bar", got[1]);
+    try std.testing.expectEqualStrings("baz", got[2]);
+}
+
+test "literal alternation: non-capturing group wraps" {
+    const got = (try altLiteralFor(std.testing.allocator, "(?:cat|dog|bird)")).?;
+    defer {
+        for (got) |b| std.testing.allocator.free(b);
+        std.testing.allocator.free(got);
+    }
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+}
+
+test "literal alternation: bails on non-literal branch" {
+    try std.testing.expect((try altLiteralFor(std.testing.allocator, "foo|b.r")) == null);
+}
+
+test "literal alternation: bails on capturing group" {
+    try std.testing.expect((try altLiteralFor(std.testing.allocator, "(foo|bar)")) == null);
+}
+
+test "literal alternation: single branch is null" {
+    // Only one branch — handled by extractFullLiteral, not this path.
+    try std.testing.expect((try altLiteralFor(std.testing.allocator, "foo")) == null);
 }

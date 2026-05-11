@@ -55,6 +55,12 @@ pub const Regex = struct {
     /// those hits.
     literal_prefix: ?[]const u8,
 
+    /// Non-null iff the entire pattern is a literal alternation (`foo|bar|baz`).
+    /// At match time we run one `indexOfPos` scan per literal across the
+    /// haystack, then merge the results — far cheaper than the DFA for
+    /// patterns made of a few literal alternatives. Owned by `arena`.
+    literal_alternation: ?[]const []const u8,
+
     /// Non-null iff the whole pattern is a `class+` / `class{n,}` repeat —
     /// the matcher then bypasses the DFA entirely and uses a precomputed
     /// 256-byte membership table to extract every contiguous run of
@@ -104,6 +110,11 @@ pub const Regex = struct {
         else
             try prefilter.extractLiteralPrefix(arena.allocator(), root, 3);
 
+        const lit_alt: ?[]const []const u8 = if (flags.case_insensitive)
+            null
+        else
+            try prefilter.extractLiteralAlternation(arena.allocator(), root);
+
         // Single-class-repeat fast path: precompute a 256-byte membership
         // table so the runtime scanner is a tight `if (table[byte])` loop.
         const single_class: ?*const [256]bool = blk: {
@@ -144,6 +155,7 @@ pub const Regex = struct {
             .pure_literal = pure_lit,
             .required_literal = req_lit,
             .literal_prefix = lit_prefix,
+            .literal_alternation = lit_alt,
             .single_class_table = single_class,
             .dfa_engine = dfa_engine,
         };
@@ -162,6 +174,7 @@ pub const Regex = struct {
             if (std.mem.indexOf(u8, input, lit) == null) return null;
         }
         if (self.pure_literal) |lit| return try literalFirst(alloc, lit, input);
+        if (self.literal_alternation) |lits| return try multiLiteralFirst(alloc, lits, input);
         if (self.single_class_table) |tbl| return try singleClassFirst(alloc, tbl, input);
         if (self.literal_prefix) |prefix| if (self.dfa_engine) |*d|
             return try dfaFirstWithPrefix(alloc, d, input, prefix);
@@ -179,6 +192,7 @@ pub const Regex = struct {
             }
         }
         if (self.pure_literal) |lit| return try literalAll(alloc, lit, input);
+        if (self.literal_alternation) |lits| return try multiLiteralAll(alloc, lits, input);
         if (self.single_class_table) |tbl| return try singleClassAll(alloc, tbl, input);
         if (self.literal_prefix) |prefix| if (self.dfa_engine) |*d|
             return try dfaAllWithPrefix(alloc, d, input, prefix);
@@ -429,6 +443,116 @@ test "single-class fast path: [a-z]+ ignores uppercase" {
         std.testing.allocator.free(ms);
     }
     try std.testing.expectEqual(@as(usize, 2), ms.len);
+}
+
+
+// ── Multi-literal alternation fast paths ──
+//
+// For `lit1|lit2|...|litN` patterns we scan the haystack once per literal
+// using std.mem.indexOfPos (memchr-backed when the literal is one byte,
+// SIMD-accelerated memmem otherwise). On each step we pick the earliest
+// candidate across all literals and emit it. The amortised cost is
+// O(needles * input.len) but each scan is on Zig stdlib's tight loop —
+// faster than a DFA whose hot path costs ~5 ns/byte. ripgrep accomplishes
+// the same with Teddy (a SIMD-pshufb-based multi-string algorithm); this
+// is the scalar equivalent.
+
+const LiteralHit = struct {
+    start: usize,
+    len: usize,
+    /// Index of the matching literal in the alternation. Lower wins ties
+    /// (leftmost-first alternation semantics, matching Python re).
+    lit_idx: u32,
+};
+
+fn hitLessThan(_: void, a: LiteralHit, b: LiteralHit) bool {
+    if (a.start != b.start) return a.start < b.start;
+    return a.lit_idx < b.lit_idx;
+}
+
+/// Collect every occurrence of every literal across the input in one
+/// pass per literal. Each pass is `std.mem.indexOfPos` (memchr/memmem in
+/// Zig stdlib). For N literals on H bytes that's O(N · H), then a sort
+/// of M total hits at O(M log M). Avoids the O(N · H · M) explosion the
+/// naïve "earliest hit per step" scanner showed on dense workloads.
+fn collectAllLiteralHits(alloc: std.mem.Allocator, literals: []const []const u8, input: []const u8) ![]LiteralHit {
+    var hits: std.ArrayList(LiteralHit) = .empty;
+    errdefer hits.deinit(alloc);
+    for (literals, 0..) |lit, idx| {
+        if (lit.len == 0) continue;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, input, pos, lit)) |found| {
+            try hits.append(alloc, .{
+                .start = found,
+                .len = lit.len,
+                .lit_idx = @intCast(idx),
+            });
+            pos = found + 1;
+        }
+    }
+    const slice = try hits.toOwnedSlice(alloc);
+    std.mem.sort(LiteralHit, slice, {}, hitLessThan);
+    return slice;
+}
+
+fn multiLiteralFirst(alloc: std.mem.Allocator, literals: []const []const u8, input: []const u8) !?Match {
+    // search() only needs the first hit — we can stop as soon as we find
+    // the leftmost across all literals. Cheaper than the full collect.
+    var best: ?LiteralHit = null;
+    for (literals, 0..) |lit, idx| {
+        if (lit.len == 0) continue;
+        const hit = std.mem.indexOf(u8, input, lit) orelse continue;
+        if (best) |b| {
+            if (hit < b.start or (hit == b.start and idx < b.lit_idx)) {
+                best = LiteralHit{ .start = hit, .len = lit.len, .lit_idx = @intCast(idx) };
+            }
+        } else {
+            best = LiteralHit{ .start = hit, .len = lit.len, .lit_idx = @intCast(idx) };
+        }
+    }
+    const h = best orelse return null;
+    const caps = try alloc.alloc(?Span, 1);
+    caps[0] = .{ .start = h.start, .end = h.start + h.len };
+    return .{ .span = .{ .start = h.start, .end = h.start + h.len }, .captures = caps };
+}
+
+fn multiLiteralAll(alloc: std.mem.Allocator, literals: []const []const u8, input: []const u8) ![]Match {
+    const all_hits = try collectAllLiteralHits(alloc, literals, input);
+    defer alloc.free(all_hits);
+
+    var out: std.ArrayList(Match) = .empty;
+    errdefer {
+        for (out.items) |*m| @constCast(m).deinit(alloc);
+        out.deinit(alloc);
+    }
+    var cursor: usize = 0;
+    for (all_hits) |h| {
+        // Skip hits that overlap with an already-emitted match. With the
+        // hits sorted by (start, lit_idx), this also collapses the case
+        // where two literals would have matched at the same position —
+        // leftmost-first wins.
+        if (h.start < cursor) continue;
+        const caps = try alloc.alloc(?Span, 1);
+        caps[0] = .{ .start = h.start, .end = h.start + h.len };
+        try out.append(alloc, .{
+            .span = .{ .start = h.start, .end = h.start + h.len },
+            .captures = caps,
+        });
+        cursor = h.start + h.len;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "multi-literal alternation findAll" {
+    var r = try Regex.compile(std.testing.allocator, "cat|dog|bird");
+    defer r.deinit();
+    try std.testing.expect(r.literal_alternation != null);
+    const ms = try r.findAll(std.testing.allocator, "the cat saw a dog and a bird");
+    defer {
+        for (ms) |*m| @constCast(m).deinit(std.testing.allocator);
+        std.testing.allocator.free(ms);
+    }
+    try std.testing.expectEqual(@as(usize, 3), ms.len);
 }
 
 test "module imports compile" {
