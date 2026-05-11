@@ -180,6 +180,40 @@ fn collectPrefix(node: *const ast.Node, arena: std.mem.Allocator, buf: *std.Arra
     }
 }
 
+/// If the entire AST is a single `class+` or `class{n,}` quantifier (e.g.
+/// `\d+`, `[a-z]+`, `\w{2,}`), return the underlying class so callers can
+/// dispatch to a specialised SIMD-only scanner: "first byte in class →
+/// first byte not in class → emit; repeat." Avoids the DFA entirely and
+/// runs at memmem speed.
+///
+/// Returns null for any compound shape (concat, alt, group with non-trivial
+/// structure, anchors, etc.) — those need the real engine.
+pub fn extractSingleClassRepeat(root: *const ast.Node) ?*const ast.Class {
+    // Allow `(?:class+)` and `(class+)` wrapping but only if the group is
+    // non-capturing (we don't track group spans on this path).
+    var n = root;
+    while (true) {
+        switch (n.*) {
+            .group => |g| if (!g.capturing) {
+                n = g.sub;
+                continue;
+            } else return null,
+            else => break,
+        }
+    }
+    switch (n.*) {
+        .repeat => |r| {
+            if (r.min < 1) return null; // min=0 has a zero-width quirk we skip
+            if (r.max != std.math.maxInt(u32)) return null;
+            switch (r.sub.*) {
+                .class => |cls| return cls,
+                else => return null,
+            }
+        },
+        else => return null,
+    }
+}
+
 // ── Tests ──
 
 const parser = @import("parser.zig");
@@ -212,6 +246,14 @@ fn prefixFor(alloc: std.mem.Allocator, pattern: []const u8) !?[]const u8 {
     const lit = try extractLiteralPrefix(arena.allocator(), root, 3);
     if (lit) |bytes| return try alloc.dupe(u8, bytes);
     return null;
+}
+
+fn singleClassFor(pattern: []const u8) !bool {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), pattern);
+    const root = try p.parseRoot();
+    return extractSingleClassRepeat(root) != null;
 }
 
 test "full literal: plain identifier" {
@@ -305,4 +347,37 @@ test "literal prefix: stops at optional byte" {
     const got = (try prefixFor(std.testing.allocator, "foox?bar")).?;
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("foo", got);
+}
+
+test "single-class-repeat: \\d+" {
+    try std.testing.expect(try singleClassFor("\\d+"));
+}
+
+test "single-class-repeat: [a-z]+" {
+    try std.testing.expect(try singleClassFor("[a-z]+"));
+}
+
+test "single-class-repeat: counted lower bound" {
+    try std.testing.expect(try singleClassFor("[0-9]{3,}"));
+}
+
+test "single-class-repeat: non-capturing group is transparent" {
+    try std.testing.expect(try singleClassFor("(?:\\w+)"));
+}
+
+test "single-class-repeat: capturing group blocks" {
+    try std.testing.expect(!(try singleClassFor("(\\w+)")));
+}
+
+test "single-class-repeat: concat blocks" {
+    try std.testing.expect(!(try singleClassFor("\\d+abc")));
+}
+
+test "single-class-repeat: alternation blocks" {
+    try std.testing.expect(!(try singleClassFor("\\d+|abc")));
+}
+
+test "single-class-repeat: star (min=0) skipped" {
+    // min=0 has a zero-width-match quirk — not yet handled by the fast path.
+    try std.testing.expect(!(try singleClassFor("\\d*")));
 }

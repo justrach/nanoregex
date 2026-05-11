@@ -81,6 +81,7 @@ pub const Dfa = struct {
     /// at compile time so the inner-loop test stays branch-cheap.
     dot_all: bool,
 
+
     pub fn fromNfa(alloc: std.mem.Allocator, n: *const nfa.Nfa, root: *const ast.Node, opts: BuildOptions) Error!Dfa {
         if (n.n_groups != 0) return Error.HasCaptures;
         if (containsAnchor(root)) return Error.HasAnchors;
@@ -103,6 +104,7 @@ pub const Dfa = struct {
 
         const transitions = try aa.alloc(DfaStateId, @as(usize, MAX_STATES) * mt.n_classes);
         @memset(transitions, UNCOMPUTED);
+
 
         var dfa: Dfa = .{
             .arena = arena,
@@ -215,13 +217,9 @@ pub const Dfa = struct {
         var longest: ?usize = if (self.states.items[cur].accepts) start else null;
         const byte_to_class = &self.minterm.byte_to_class;
         const n_classes: usize = self.minterm.n_classes;
-        // `transitions` is a fixed-size buffer allocated once in fromNfa
-        // — capturing its slice is safe. `states.items`, on the other
-        // hand, can be reallocated by computeAndCacheTransition's call
-        // to internState, so we re-read it on the read-back path.
         const transitions = self.transitions;
 
-        var i = start;
+        var i: usize = start;
         while (i < input.len) : (i += 1) {
             const class_id: usize = byte_to_class[input[i]];
             const idx = @as(usize, cur) * n_classes + class_id;
@@ -235,6 +233,7 @@ pub const Dfa = struct {
         }
         return longest;
     }
+
 
     /// Find every non-overlapping match span in `input`. Tries each
     /// starting position; on a hit, skips past the match end. Zero-width

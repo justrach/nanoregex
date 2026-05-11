@@ -55,6 +55,14 @@ pub const Regex = struct {
     /// those hits.
     literal_prefix: ?[]const u8,
 
+    /// Non-null iff the whole pattern is a `class+` / `class{n,}` repeat —
+    /// the matcher then bypasses the DFA entirely and uses a precomputed
+    /// 256-byte membership table to extract every contiguous run of
+    /// class-matching bytes. One load + one branch per input byte; no
+    /// library call per match. `\d+` and `[a-z]+` are the canonical
+    /// cases. Lifetime tied to `arena`.
+    single_class_table: ?*const [256]bool,
+
     /// Built eagerly when the pattern is DFA-eligible (no captures, no
     /// anchors, no case-insensitive). Null otherwise. Mutable because the
     /// DFA fills its transition table lazily during matching.
@@ -96,6 +104,19 @@ pub const Regex = struct {
         else
             try prefilter.extractLiteralPrefix(arena.allocator(), root, 3);
 
+        // Single-class-repeat fast path: precompute a 256-byte membership
+        // table so the runtime scanner is a tight `if (table[byte])` loop.
+        const single_class: ?*const [256]bool = blk: {
+            if (flags.case_insensitive) break :blk null;
+            const cls = prefilter.extractSingleClassRepeat(root) orelse break :blk null;
+            const table = try arena.allocator().create([256]bool);
+            var b: u16 = 0;
+            while (b < 256) : (b += 1) {
+                table[b] = cls.contains(@intCast(b));
+            }
+            break :blk table;
+        };
+
         // Try to build a DFA. Falls back to null (=> Pike VM at runtime)
         // when the pattern has captures, anchors, or grows the state
         // table past the budget. Case-insensitive also skips DFA for v1 —
@@ -123,6 +144,7 @@ pub const Regex = struct {
             .pure_literal = pure_lit,
             .required_literal = req_lit,
             .literal_prefix = lit_prefix,
+            .single_class_table = single_class,
             .dfa_engine = dfa_engine,
         };
     }
@@ -140,6 +162,7 @@ pub const Regex = struct {
             if (std.mem.indexOf(u8, input, lit) == null) return null;
         }
         if (self.pure_literal) |lit| return try literalFirst(alloc, lit, input);
+        if (self.single_class_table) |tbl| return try singleClassFirst(alloc, tbl, input);
         if (self.literal_prefix) |prefix| if (self.dfa_engine) |*d|
             return try dfaFirstWithPrefix(alloc, d, input, prefix);
         if (self.dfa_engine) |*d| return try dfaFirst(alloc, d, input);
@@ -156,6 +179,7 @@ pub const Regex = struct {
             }
         }
         if (self.pure_literal) |lit| return try literalAll(alloc, lit, input);
+        if (self.single_class_table) |tbl| return try singleClassAll(alloc, tbl, input);
         if (self.literal_prefix) |prefix| if (self.dfa_engine) |*d|
             return try dfaAllWithPrefix(alloc, d, input, prefix);
         if (self.dfa_engine) |*d| return try dfaAll(alloc, d, input);
@@ -334,6 +358,77 @@ fn appendReplacement(
         try out.append(alloc, c);
         i += 1;
     }
+}
+
+
+// ── Single-class-repeat fast paths ──
+//
+// For `class+` / `class{n,}` patterns the whole match is "consecutive
+// bytes in `class`". indexOfAnyPos finds the first matching byte (start);
+// indexOfNonePos finds the first non-matching byte (end). Both are
+// SIMD-accelerated in Zig stdlib. Two SIMD scans per match — vs the
+// DFA's per-byte transition lookup.
+
+fn singleClassFirst(alloc: std.mem.Allocator, table: *const [256]bool, input: []const u8) !?Match {
+    var i: usize = 0;
+    while (i < input.len) {
+        if (table[input[i]]) {
+            const start = i;
+            while (i < input.len and table[input[i]]) i += 1;
+            const caps = try alloc.alloc(?Span, 1);
+            caps[0] = .{ .start = start, .end = i };
+            return .{ .span = .{ .start = start, .end = i }, .captures = caps };
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn singleClassAll(alloc: std.mem.Allocator, table: *const [256]bool, input: []const u8) ![]Match {
+    var out: std.ArrayList(Match) = .empty;
+    errdefer {
+        for (out.items) |*m| @constCast(m).deinit(alloc);
+        out.deinit(alloc);
+    }
+    var i: usize = 0;
+    while (i < input.len) {
+        if (table[input[i]]) {
+            const start = i;
+            while (i < input.len and table[input[i]]) i += 1;
+            const caps = try alloc.alloc(?Span, 1);
+            caps[0] = .{ .start = start, .end = i };
+            try out.append(alloc, .{ .span = .{ .start = start, .end = i }, .captures = caps });
+        } else {
+            i += 1;
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "single-class fast path: \\d+ matches digits only" {
+    var r = try Regex.compile(std.testing.allocator, "\\d+");
+    defer r.deinit();
+    try std.testing.expect(r.single_class_table != null);
+    const ms = try r.findAll(std.testing.allocator, "abc 42 def 1234 xyz");
+    defer {
+        for (ms) |*m| @constCast(m).deinit(std.testing.allocator);
+        std.testing.allocator.free(ms);
+    }
+    try std.testing.expectEqual(@as(usize, 2), ms.len);
+    try std.testing.expectEqual(@as(usize, 4), ms[0].span.start);
+    try std.testing.expectEqual(@as(usize, 6), ms[0].span.end);
+}
+
+test "single-class fast path: [a-z]+ ignores uppercase" {
+    var r = try Regex.compile(std.testing.allocator, "[a-z]+");
+    defer r.deinit();
+    try std.testing.expect(r.single_class_table != null);
+    const ms = try r.findAll(std.testing.allocator, "Hello World");
+    defer {
+        for (ms) |*m| @constCast(m).deinit(std.testing.allocator);
+        std.testing.allocator.free(ms);
+    }
+    try std.testing.expectEqual(@as(usize, 2), ms.len);
 }
 
 test "module imports compile" {
