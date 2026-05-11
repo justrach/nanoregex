@@ -26,6 +26,12 @@ pub const exec = @import("exec.zig");
 pub const prefilter = @import("prefilter.zig");
 pub const dfa = @import("dfa.zig");
 pub const minterm = @import("minterm.zig");
+const comptime_mod = @import("comptime.zig");
+
+/// comptime-specialised matcher factory. For patterns known at compile time,
+/// returns a zero-overhead specialised scanner. See `src/comptime.zig`.
+pub const compileComptime = comptime_mod.compileComptime;
+pub fn ComptimeRegex(comptime pattern: []const u8) type { return comptime_mod.ComptimeRegex(pattern); }
 
 pub const Flags = exec.Flags;
 pub const Span = exec.Span;

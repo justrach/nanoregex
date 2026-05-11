@@ -38,6 +38,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench);
 
+    const bench_comptime = b.addExecutable(.{
+        .name = "nanoregex_bench_comptime",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_comptime.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{ .{ .name = "nanoregex", .module = nanoregex_mod } },
+        }),
+    });
+    b.installArtifact(bench_comptime);
+
     // ─────────────────────────────────────────────────────────────────
     // Per-module test steps.
     //
@@ -57,6 +69,7 @@ pub fn build(b: *std.Build) void {
     _ = addTestStep(b, "test-dfa", "src/dfa.zig", &.{}, user_filter, target, optimize);
     _ = addTestStep(b, "test-minterm", "src/minterm.zig", &.{}, user_filter, target, optimize);
     _ = addTestStep(b, "test-root", "src/root.zig", &.{}, user_filter, target, optimize);
+    _ = addTestStep(b, "test-comptime", "src/comptime.zig", &.{}, user_filter, target, optimize);
 
     // ── Pre-baked filtered shortcuts ──
     // Each named step runs only tests whose name contains one of the
@@ -98,6 +111,7 @@ pub fn build(b: *std.Build) void {
     const prefilter_all = addTestStep(b, "_test-prefilter-all", "src/prefilter.zig", &.{}, user_filter, target, optimize);
     const dfa_all      = addTestStep(b, "_test-dfa-all",      "src/dfa.zig",      &.{}, user_filter, target, optimize);
     const root_all     = addTestStep(b, "_test-root-all",     "src/root.zig",     &.{}, user_filter, target, optimize);
+    const comptime_all = addTestStep(b, "_test-comptime-all", "src/comptime.zig", &.{}, user_filter, target, optimize);
 
     const test_all = b.step("test-all", "Run ALL unit tests across every module (slow — use named steps in the inner loop)");
     test_all.dependOn(ast_all);
@@ -107,6 +121,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(prefilter_all);
     test_all.dependOn(dfa_all);
     test_all.dependOn(root_all);
+    test_all.dependOn(comptime_all);
 
     // ── Parity vs Python re (separate; never auto-runs) ──
     const parity_cmd = b.addSystemCommand(&.{"bash"});
